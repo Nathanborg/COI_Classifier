@@ -152,6 +152,9 @@ class COIClassifier(tk.Tk):
         )
         self.folder_label.pack(side="left", padx=12, pady=6, fill="x", expand=True)
 
+        ttk.Button(top, text="📂 Open Project…",
+                   command=lambda: self.open_project()).pack(
+            side="left", padx=(0, 10), pady=6)
         ttk.Button(top, text="💾 Save", command=self.save_quick).pack(
             side="left", padx=(0, 4), pady=6)
         ttk.Button(top, text="Save As…", command=self.save_as).pack(
