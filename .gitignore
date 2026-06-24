@@ -7,5 +7,7 @@ _test_photos/
 _screenshot.png
 _smoketest.py
 
-# Classification output produced at runtime
+# Classification output / project files produced at runtime
 coi_labels.csv
+pixel_labels.csv
+*.coiproj

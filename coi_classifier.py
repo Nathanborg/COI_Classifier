@@ -2,27 +2,37 @@
 COI Classifier
 ==============
 
-A tiny desktop tool for rapidly scoring close-up photos.
+A desktop tool for rapidly scoring close-up photos and collecting pixel-level
+liana / not-liana training samples.
 
 Workflow (like a "Label box", but for a continuous COI value):
-  1. On launch, pick a folder of photos.
+  1. Open a folder of photos (File > Open Folder).
   2. A random un-scored photo is shown. Zoom in to inspect detail.
-  3. Drag the slider at the bottom (0-100 %), then click Submit (or press Enter).
-  4. The score is appended to a CSV and the next random photo appears.
+  3. Drag the slider at the bottom (0-100 %) to set the COI.
+  4. Optionally label individual pixels as liana / not-liana.
+  5. Click Submit (or press Enter) -> the next random photo appears.
+
+Saving & exporting:
+  * Save / Save As       -> store ALL progress (scores + pixel labels) in a
+                            .coiproj project file so you can close and resume.
+  * Export COI CSV       -> filename, coi, timestamp
+  * Export Pixel CSV     -> filename, x, y, r, g, b, label
 
 Zoom / pan:
-  * Mouse wheel       -> zoom in / out (centred on the cursor)
-  * Click + drag      -> pan around when zoomed in
-  * + / - / Reset      -> zoom buttons in the top bar
-  * Double-click      -> reset to fit
+  * Mouse wheel  -> zoom in / out (centred on the cursor)
+  * Click + drag -> pan around when zoomed in
+  * Double-click -> reset to fit
 
-Output CSV (saved inside the chosen photo folder as `coi_labels.csv`):
-  filename, coi, timestamp
+Pixel labelling:
+  * Tick "Label pixels", choose Liana / Not-liana (or press 1 / 2)
+  * Left-click a pixel to drop a labelled point (samples its RGB)
+  * Right-click a point to remove it
 
 Requirements: Python 3.8+, Pillow  (pip install pillow)
 """
 
 import csv
+import json
 import os
 import random
 import sys
@@ -33,49 +43,91 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
-CSV_NAME = "coi_labels.csv"
 CSV_HEADER = ["filename", "coi", "timestamp"]
+PIXEL_CSV_HEADER = ["filename", "x", "y", "r", "g", "b", "label"]
+PROJECT_EXT = ".coiproj"
 
 MAX_ZOOM = 12.0     # how far past "fit" the user can zoom in
 ZOOM_STEP = 1.25    # multiplier per wheel notch / button press
+CLICK_SLOP = 3      # px of movement below which a drag counts as a click
+MARKER_R = 5        # radius of a pixel-label marker, in screen px
+
+CLASS_LABELS = {"liana": "Liana", "no_liana": "Not-liana"}
+CLASS_COLORS = {"liana": "#ff4d4d", "no_liana": "#4dd2ff"}
 
 
 class COIClassifier(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("COI Classifier")
-        self.geometry("980x820")
-        self.minsize(640, 560)
+        self.geometry("1040x860")
+        self.minsize(720, 600)
         self.configure(bg="#1e1e1e")
 
-        # State
+        # ---- data state -------------------------------------------------
         self.folder = None
-        self.csv_path = None
-        self.all_images = []        # every image file in the folder
-        self.remaining = []         # not-yet-scored images (shuffled queue)
-        self.current = None         # current image filename
-        self._photo = None          # keep a reference so it isn't GC'd
-        self._raw_image = None      # the loaded PIL image
+        self.project_path = None             # current .coiproj file (if saved)
+        self.all_images = []                 # every image file in the folder
+        self.remaining = []                  # not-yet-scored queue (shuffled)
+        self.current = None                  # current image filename
+        self.results = {}                    # filename -> {"coi", "timestamp"}
+        self.annotations = {}                # filename -> [ {x,y,r,g,b,label} ]
+        self.dirty = False                   # unsaved changes?
 
-        # Zoom / pan state
-        self.zoom = 1.0             # user zoom on top of the fit-to-window scale
-        self.pan_x = 0.0            # image-centre offset from canvas centre (px)
-        self.pan_y = 0.0
-        self._drag_anchor = None    # (mouse, pan) snapshot while dragging
+        # ---- image / view state ----------------------------------------
+        self._raw_image = None
+        self._photo = None                   # keep a ref so it isn't GC'd
+        self.zoom = 1.0
+        self.pan_x = self.pan_y = 0.0
+        self._scale = 1.0                    # last render scale (canvas->img)
+        self._tlx = self._tly = 0.0          # last render image top-left (px)
+        self._drag = None                    # (x, y, pan_x, pan_y, moved)
 
+        self._build_menu()
         self._build_ui()
-        self.bind("<Return>", lambda e: self._submit())
-        self.bind("<Configure>", self._on_resize)
 
-        # Kick things off. A folder may be passed on the command line
-        # (handy for shortcuts / testing); otherwise prompt for one.
-        start_folder = sys.argv[1] if len(sys.argv) > 1 else None
-        if start_folder and os.path.isdir(start_folder):
-            self.after(100, lambda: self.load_folder(start_folder))
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Return>", lambda e: self._submit())
+        self.bind("<Control-s>", lambda e: self.save_quick())
+        self.bind("<Control-S>", lambda e: self.save_as())
+        self.bind("<Configure>", self._on_resize)
+        self.bind("<Left>", lambda e: self._nudge(-1))
+        self.bind("<Right>", lambda e: self._nudge(1))
+        self.bind("<Shift-Left>", lambda e: self._nudge(-5))
+        self.bind("<Shift-Right>", lambda e: self._nudge(5))
+        self.bind("<Key-1>", lambda e: self.pixel_class.set("liana"))
+        self.bind("<Key-2>", lambda e: self.pixel_class.set("no_liana"))
+
+        # A folder OR a project file may be passed on the command line.
+        arg = sys.argv[1] if len(sys.argv) > 1 else None
+        if arg and os.path.isfile(arg):
+            self.after(100, lambda: self.open_project(arg))
+        elif arg and os.path.isdir(arg):
+            self.after(100, lambda: self.load_folder(arg))
         else:
             self.after(100, self.choose_folder)
 
-    # ---------------------------------------------------------------- UI ---
+    # ============================================================= menu ===
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        filem = tk.Menu(menubar, tearoff=0)
+        filem.add_command(label="Open Folder…", command=self.choose_folder)
+        filem.add_command(label="Open Project…", command=lambda: self.open_project())
+        filem.add_separator()
+        filem.add_command(label="Save Project", command=self.save_quick,
+                          accelerator="Ctrl+S")
+        filem.add_command(label="Save Project As…", command=self.save_as,
+                          accelerator="Ctrl+Shift+S")
+        filem.add_separator()
+        filem.add_command(label="Export COI CSV…", command=self.export_csv)
+        filem.add_command(label="Export Pixel Labels CSV…",
+                          command=self.export_pixel_csv)
+        filem.add_separator()
+        filem.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=filem)
+        self.config(menu=menubar)
+
+    # =============================================================== UI ===
     def _build_ui(self):
         style = ttk.Style(self)
         try:
@@ -86,7 +138,7 @@ class COIClassifier(tk.Tk):
         style.configure("Zoom.TButton", padding=(8, 4), font=("Segoe UI", 12, "bold"))
         style.configure("Big.Horizontal.TScale", troughcolor="#3a3a3a")
 
-        # Top bar -----------------------------------------------------------
+        # ---- Top bar: folder + save + zoom ------------------------------
         top = tk.Frame(self, bg="#2a2a2a")
         top.pack(side="top", fill="x")
 
@@ -96,7 +148,11 @@ class COIClassifier(tk.Tk):
         )
         self.folder_label.pack(side="left", padx=12, pady=6, fill="x", expand=True)
 
-        # Zoom controls
+        ttk.Button(top, text="💾 Save", command=self.save_quick).pack(
+            side="left", padx=(0, 4), pady=6)
+        ttk.Button(top, text="Save As…", command=self.save_as).pack(
+            side="left", padx=(0, 10), pady=6)
+
         zoom_box = tk.Frame(top, bg="#2a2a2a")
         zoom_box.pack(side="left", padx=8)
         ttk.Button(zoom_box, text="–", width=3, style="Zoom.TButton",
@@ -110,60 +166,73 @@ class COIClassifier(tk.Tk):
                    command=self._reset_view).pack(side="left", padx=(6, 2))
 
         ttk.Button(top, text="Change folder…", command=self.choose_folder).pack(
-            side="right", padx=8, pady=6
-        )
-
+            side="right", padx=8, pady=6)
         self.progress_label = tk.Label(
-            top, text="", bg="#2a2a2a", fg="#9ad29a", font=("Segoe UI", 10, "bold")
-        )
+            top, text="", bg="#2a2a2a", fg="#9ad29a", font=("Segoe UI", 10, "bold"))
         self.progress_label.pack(side="right", padx=12)
 
-        # Image area (Canvas so we can zoom & pan). Packed LAST (see end of
-        # this method) so the fixed top/bottom bars always keep their space and
-        # the canvas just absorbs whatever is left over. width/height are tiny
-        # on purpose so the canvas never forces the window to grow.
+        # ---- Pixel-labelling toolbar ------------------------------------
+        annot = tk.Frame(self, bg="#232323")
+        annot.pack(side="top", fill="x")
+
+        tk.Label(annot, text="Pixel labels:", bg="#232323", fg="#dddddd",
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(12, 8), pady=6)
+
+        self.annotate_mode = tk.BooleanVar(value=False)
+        self.annotate_mode.trace_add("write", lambda *_: self._update_cursor())
+        ttk.Checkbutton(annot, text="Label pixels (click to mark)",
+                        variable=self.annotate_mode).pack(side="left", padx=4)
+
+        self.pixel_class = tk.StringVar(value="liana")
+        tk.Radiobutton(annot, text="🔴 Liana (1)", variable=self.pixel_class,
+                       value="liana", bg="#232323", fg="#ff8a8a",
+                       selectcolor="#232323", activebackground="#232323",
+                       font=("Segoe UI", 9)).pack(side="left", padx=(12, 2))
+        tk.Radiobutton(annot, text="🔵 Not-liana (2)", variable=self.pixel_class,
+                       value="no_liana", bg="#232323", fg="#8ad6ff",
+                       selectcolor="#232323", activebackground="#232323",
+                       font=("Segoe UI", 9)).pack(side="left", padx=2)
+
+        ttk.Button(annot, text="Undo point", command=self._undo_point).pack(
+            side="left", padx=(14, 2), pady=4)
+        ttk.Button(annot, text="Clear this photo", command=self._clear_points).pack(
+            side="left", padx=2, pady=4)
+
+        self.count_label = tk.Label(annot, text="", bg="#232323", fg="#999999",
+                                    font=("Segoe UI", 9))
+        self.count_label.pack(side="right", padx=12)
+
+        # ---- Image canvas (packed LAST so the bars keep their space) ----
         self.canvas = tk.Canvas(self, bg="#1e1e1e", highlightthickness=0,
                                 width=400, height=300, cursor="fleur")
-        self._img_id = None
-        self._text_id = None
-
-        # Zoom: mouse wheel (Windows/macOS use <MouseWheel>; X11 uses Button-4/5)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Button-4>", lambda e: self._on_wheel(e, force=1))
         self.canvas.bind("<Button-5>", lambda e: self._on_wheel(e, force=-1))
-        # Pan: drag with the left button
-        self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
-        self.canvas.bind("<B1-Motion>", self._on_drag_move)
-        self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
-        # Double-click resets the view
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", lambda e: self._reset_view())
+        self.canvas.bind("<ButtonPress-3>", self._on_right_click)
 
-        self.name_label = tk.Label(
-            self, text="", bg="#1e1e1e", fg="#888888", font=("Consolas", 9)
-        )
+        self.name_label = tk.Label(self, text="", bg="#1e1e1e", fg="#888888",
+                                   font=("Consolas", 9))
 
-        # Bottom control bar ------------------------------------------------
+        # ---- Bottom bar: COI slider + submit ----------------------------
         bottom = tk.Frame(self, bg="#2a2a2a")
         bottom.pack(side="bottom", fill="x")
 
-        # COI value readout
         self.value_var = tk.DoubleVar(value=50.0)
         self.value_readout = tk.Label(
             bottom, text="COI: 50 %", bg="#2a2a2a", fg="#ffffff",
-            font=("Segoe UI", 16, "bold"), width=12,
-        )
+            font=("Segoe UI", 16, "bold"), width=12)
         self.value_readout.grid(row=0, column=0, rowspan=2, padx=16, pady=12)
 
         tk.Label(bottom, text="0", bg="#2a2a2a", fg="#888888",
                  font=("Segoe UI", 9)).grid(row=0, column=1, sticky="s")
-
-        self.slider = ttk.Scale(
-            bottom, from_=0, to=100, orient="horizontal",
-            variable=self.value_var, command=self._on_slide,
-            style="Big.Horizontal.TScale",
-        )
+        self.slider = ttk.Scale(bottom, from_=0, to=100, orient="horizontal",
+                                variable=self.value_var, command=self._on_slide,
+                                style="Big.Horizontal.TScale")
         self.slider.grid(row=0, column=2, sticky="ew", padx=8, pady=(14, 0))
-
         tk.Label(bottom, text="100", bg="#2a2a2a", fg="#888888",
                  font=("Segoe UI", 9)).grid(row=0, column=3, sticky="s")
 
@@ -173,87 +242,190 @@ class COIClassifier(tk.Tk):
 
         hint = tk.Label(
             bottom,
-            text="Slider sets COI, then Submit.  Wheel = zoom · drag = pan · double-click = reset.  ←/→ nudge 1, Shift+←/→ nudge 5.",
-            bg="#2a2a2a", fg="#777777", font=("Segoe UI", 8),
-        )
+            text="Slider sets COI, then Submit.  Wheel=zoom · drag=pan · double-click=reset.  ←/→ nudge 1, Shift+←/→ nudge 5.",
+            bg="#2a2a2a", fg="#777777", font=("Segoe UI", 8))
         hint.grid(row=1, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 8))
-
         bottom.grid_columnconfigure(2, weight=1)
 
-        # Pack the filename caption and the image canvas LAST, so the fixed
-        # top/bottom bars get their space first. The canvas (expand=True) then
-        # fills the remaining area and is the thing that shrinks when the
-        # window is small — the slider stays put.
+        # Pack caption + canvas last so the fixed bars are reserved first and
+        # the canvas (expand) is what shrinks when the window is small.
         self.name_label.pack(side="bottom", pady=(2, 4))
-        self.canvas.pack(side="top", fill="both", expand=True, padx=12, pady=(12, 4))
+        self.canvas.pack(side="top", fill="both", expand=True, padx=12, pady=(10, 4))
 
-        # Keyboard nudges
-        self.bind("<Left>", lambda e: self._nudge(-1))
-        self.bind("<Right>", lambda e: self._nudge(1))
-        self.bind("<Shift-Left>", lambda e: self._nudge(-5))
-        self.bind("<Shift-Right>", lambda e: self._nudge(5))
-
-    # ------------------------------------------------------------- folder ---
+    # ============================================================ folder ===
     def choose_folder(self):
+        if not self._confirm_discard():
+            return
         folder = filedialog.askdirectory(title="Select the folder of close-up photos")
         if not folder:
-            if self.folder is None:
-                # Nothing selected and nothing loaded yet -> exit cleanly.
+            if self.folder is None and self.project_path is None:
                 self.destroy()
             return
         self.load_folder(folder)
 
-    def load_folder(self, folder):
-        images = [
-            f for f in sorted(os.listdir(folder))
-            if os.path.splitext(f)[1].lower() in IMAGE_EXTS
-        ]
+    def load_folder(self, folder, results=None, annotations=None,
+                     project_path=None):
+        images = [f for f in sorted(os.listdir(folder))
+                  if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
         if not images:
             messagebox.showwarning(
                 "No images",
                 f"No image files found in:\n{folder}\n\n"
-                f"Supported types: {', '.join(sorted(IMAGE_EXTS))}",
-            )
+                f"Supported types: {', '.join(sorted(IMAGE_EXTS))}")
             return
 
         self.folder = folder
         self.all_images = images
-        self.csv_path = os.path.join(folder, CSV_NAME)
-        done = self._load_done_set()
+        self.results = results or {}
+        self.annotations = annotations or {}
+        self.project_path = project_path
+        self.dirty = False
 
-        self.remaining = [f for f in images if f not in done]
+        self.remaining = [f for f in images if f not in self.results]
         random.shuffle(self.remaining)
 
         self.folder_label.config(text=f"📁 {folder}")
+        self._update_title()
         self._next_image()
 
-    def _load_done_set(self):
-        """Read already-scored filenames so a session can resume safely."""
-        done = set()
-        if os.path.exists(self.csv_path):
-            try:
-                with open(self.csv_path, "r", newline="", encoding="utf-8") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        if row.get("filename"):
-                            done.add(row["filename"])
-            except Exception:
-                pass
-        return done
+    # ===================================================== project files ===
+    def _project_state(self):
+        return {
+            "version": 1,
+            "folder": self.folder,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "results": self.results,
+            "annotations": self.annotations,
+        }
 
-    # -------------------------------------------------------------- images ---
+    def save_quick(self):
+        """Save to the current project file, or fall back to Save As."""
+        if self.folder is None:
+            return False
+        if not self.project_path:
+            return self.save_as()
+        return self._write_project(self.project_path)
+
+    def save_as(self):
+        if self.folder is None:
+            messagebox.showinfo("Nothing to save", "Open a photo folder first.")
+            return False
+        default = os.path.basename(self.folder.rstrip("/\\")) or "session"
+        path = filedialog.asksaveasfilename(
+            title="Save project as",
+            defaultextension=PROJECT_EXT,
+            initialfile=f"{default}{PROJECT_EXT}",
+            initialdir=self.folder,
+            filetypes=[("COI project", f"*{PROJECT_EXT}"), ("JSON", "*.json")])
+        if not path:
+            return False
+        return self._write_project(path)
+
+    def _write_project(self, path):
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._project_state(), fh, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Could not save", f"Failed to write project:\n{exc}")
+            return False
+        self.project_path = path
+        self.dirty = False
+        self._update_title()
+        return True
+
+    def open_project(self, path=None):
+        if not self._confirm_discard():
+            return
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open project",
+                filetypes=[("COI project", f"*{PROJECT_EXT}"),
+                           ("JSON", "*.json"), ("All files", "*.*")])
+            if not path:
+                return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Could not open", f"Failed to read project:\n{exc}")
+            return
+
+        folder = data.get("folder")
+        if not folder or not os.path.isdir(folder):
+            folder = filedialog.askdirectory(
+                title="Photo folder for this project could not be found — locate it")
+            if not folder:
+                return
+        self.load_folder(folder,
+                         results=data.get("results", {}),
+                         annotations=data.get("annotations", {}),
+                         project_path=path)
+
+    # ============================================================ export ===
+    def export_csv(self):
+        if not self.results:
+            messagebox.showinfo("Nothing to export", "No photos have been scored yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export COI scores to CSV", defaultextension=".csv",
+            initialfile="coi_labels.csv",
+            initialdir=self.folder or os.getcwd(),
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(CSV_HEADER)
+                for fname in sorted(self.results):
+                    r = self.results[fname]
+                    w.writerow([fname, r["coi"], r.get("timestamp", "")])
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo("Exported",
+                            f"{len(self.results)} COI score(s) written to:\n{path}")
+
+    def export_pixel_csv(self):
+        total = sum(len(v) for v in self.annotations.values())
+        if total == 0:
+            messagebox.showinfo("Nothing to export", "No pixel labels collected yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export pixel labels to CSV", defaultextension=".csv",
+            initialfile="pixel_labels.csv",
+            initialdir=self.folder or os.getcwd(),
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(PIXEL_CSV_HEADER)
+                for fname in sorted(self.annotations):
+                    for p in self.annotations[fname]:
+                        w.writerow([fname, p["x"], p["y"],
+                                    p["r"], p["g"], p["b"], p["label"]])
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo("Exported",
+                            f"{total} pixel label(s) written to:\n{path}")
+
+    # ============================================================ images ===
     def _next_image(self):
         total = len(self.all_images)
-        done = total - len(self.remaining)
+        done = len(self.results)
         self.progress_label.config(text=f"{done} / {total} scored")
 
         if not self.remaining:
             self.current = None
             self._raw_image = None
             self._show_message("🎉  All photos scored!")
-            self.name_label.config(text=f"Results saved to {self.csv_path}")
+            self.name_label.config(text="Use File ▸ Export to save your results.")
             self.slider.state(["disabled"])
             self.submit_btn.state(["disabled"])
+            self._update_counts()
             return
 
         self.slider.state(["!disabled"])
@@ -273,14 +445,15 @@ class COIClassifier(tk.Tk):
             self._next_image()
             return
 
-        # Reset slider to midpoint and view to fit for each new photo.
-        self.value_var.set(50.0)
-        self._on_slide(50.0)
+        # Restore a previous score if this photo was already labelled.
+        prev = self.results.get(self.current)
+        self.value_var.set(prev["coi"] if prev else 50.0)
+        self._on_slide(self.value_var.get())
+        self._update_counts()
         self._reset_view()
 
-    # ---------------------------------------------------------- view / zoom ---
+    # ====================================================== view / zoom ===
     def _fit_scale(self):
-        """Scale that makes the raw image fit fully inside the canvas."""
         if self._raw_image is None:
             return 1.0
         cw = max(self.canvas.winfo_width(), 1)
@@ -294,21 +467,14 @@ class COIClassifier(tk.Tk):
         self._render_image()
 
     def _zoom_by(self, factor, focus=None):
-        """Multiply the zoom, keeping the point `focus` (canvas px) fixed."""
         if self._raw_image is None:
             return
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if focus is None:
-            focus = (cw / 2, ch / 2)
-        fx, fy = focus
-
-        old_scale = self._fit_scale() * self.zoom
+        fx, fy = focus or (cw / 2, ch / 2)
         new_zoom = max(1.0, min(MAX_ZOOM, self.zoom * factor))
         if new_zoom == self.zoom:
             return
         ratio = new_zoom / self.zoom
-
-        # Keep the source pixel under the focus point stationary.
         self.pan_x = fx - cw / 2 - (fx - cw / 2 - self.pan_x) * ratio
         self.pan_y = fy - ch / 2 - (fy - ch / 2 - self.pan_y) * ratio
         self.zoom = new_zoom
@@ -318,27 +484,10 @@ class COIClassifier(tk.Tk):
         if self._raw_image is None:
             return
         direction = force or (1 if event.delta > 0 else -1)
-        factor = ZOOM_STEP if direction > 0 else 1 / ZOOM_STEP
-        self._zoom_by(factor, focus=(event.x, event.y))
-
-    def _on_drag_start(self, event):
-        self._drag_anchor = (event.x, event.y, self.pan_x, self.pan_y)
-
-    def _on_drag_move(self, event):
-        if self._drag_anchor is None:
-            return
-        ox, oy, px, py = self._drag_anchor
-        self.pan_x = px + (event.x - ox)
-        self.pan_y = py + (event.y - oy)
-        self._render_image()
-
-    def _on_drag_end(self, _event):
-        self._drag_anchor = None
+        self._zoom_by(ZOOM_STEP if direction > 0 else 1 / ZOOM_STEP,
+                      focus=(event.x, event.y))
 
     def _clamp_pan(self, disp_w, disp_h, cw, ch):
-        """Keep the image from drifting entirely off-screen."""
-        # If the image is larger than the canvas, allow panning up to its edges;
-        # otherwise keep it centred.
         max_x = max(0.0, (disp_w - cw) / 2)
         max_y = max(0.0, (disp_h - ch) / 2)
         self.pan_x = max(-max_x, min(max_x, self.pan_x))
@@ -355,12 +504,11 @@ class COIClassifier(tk.Tk):
         disp_w, disp_h = iw * scale, ih * scale
         self._clamp_pan(disp_w, disp_h, cw, ch)
 
-        # Top-left of the (virtual) full-size displayed image, in canvas px.
         tlx = cw / 2 + self.pan_x - disp_w / 2
         tly = ch / 2 + self.pan_y - disp_h / 2
+        self._scale, self._tlx, self._tly = scale, tlx, tly
 
-        # Only resize the part of the source that's actually visible — keeps
-        # things fast even at high zoom on large photos.
+        # Only resample the visible part of the source -> fast at high zoom.
         sx0 = max(0, int((0 - tlx) / scale))
         sy0 = max(0, int((0 - tly) / scale))
         sx1 = min(iw, int((cw - tlx) / scale) + 1)
@@ -371,20 +519,18 @@ class COIClassifier(tk.Tk):
         crop = self._raw_image.crop((sx0, sy0, sx1, sy1))
         out_w = max(1, int((sx1 - sx0) * scale))
         out_h = max(1, int((sy1 - sy0) * scale))
-        resample = Image.LANCZOS if scale < 1 else Image.NEAREST if self.zoom > 4 else Image.BILINEAR
+        resample = (Image.LANCZOS if scale < 1
+                    else Image.NEAREST if self.zoom > 4 else Image.BILINEAR)
         crop = crop.resize((out_w, out_h), resample)
 
         self._photo = ImageTk.PhotoImage(crop)
-        place_x = tlx + sx0 * scale
-        place_y = tly + sy0 * scale
-
         self.canvas.delete("all")
-        self._img_id = self.canvas.create_image(place_x, place_y, anchor="nw",
-                                                 image=self._photo)
+        self.canvas.create_image(tlx + sx0 * scale, tly + sy0 * scale,
+                                 anchor="nw", image=self._photo)
         self.zoom_label.config(text=f"{int(self.zoom * 100)}%")
+        self._draw_annotations()
 
     def _show_message(self, text):
-        """Clear the canvas and show a centred message (e.g. all-done)."""
         self._photo = None
         self.canvas.delete("all")
         cw = max(self.canvas.winfo_width(), 1)
@@ -393,42 +539,174 @@ class COIClassifier(tk.Tk):
                                 font=("Segoe UI", 22, "bold"))
 
     def _on_resize(self, event):
-        # Only react to the main window resizing, and debounce a touch.
         if event.widget is self:
             if getattr(self, "_resize_job", None):
                 self.after_cancel(self._resize_job)
             self._resize_job = self.after(80, self._render_image)
 
-    # -------------------------------------------------------------- slider ---
+    # ================================================ mouse: pan & label ===
+    def _on_press(self, event):
+        self._drag = [event.x, event.y, self.pan_x, self.pan_y, False]
+
+    def _on_motion(self, event):
+        if self._drag is None:
+            return
+        ox, oy, px, py, moved = self._drag
+        if abs(event.x - ox) > CLICK_SLOP or abs(event.y - oy) > CLICK_SLOP:
+            self._drag[4] = True
+            self.pan_x = px + (event.x - ox)
+            self.pan_y = py + (event.y - oy)
+            self._render_image()
+
+    def _on_release(self, event):
+        drag, self._drag = self._drag, None
+        if drag is None or drag[4]:        # a real drag (pan) -> not a click
+            return
+        if self.annotate_mode.get():
+            self._add_point(event.x, event.y)
+
+    def _canvas_to_image(self, cx, cy):
+        if self._raw_image is None or self._scale <= 0:
+            return None
+        u = int((cx - self._tlx) / self._scale)
+        v = int((cy - self._tly) / self._scale)
+        iw, ih = self._raw_image.size
+        if 0 <= u < iw and 0 <= v < ih:
+            return u, v
+        return None
+
+    def _rgb_at(self, u, v):
+        px = self._raw_image.getpixel((u, v))
+        if isinstance(px, int):              # mode "L"
+            return px, px, px
+        return int(px[0]), int(px[1]), int(px[2])
+
+    def _add_point(self, cx, cy):
+        uv = self._canvas_to_image(cx, cy)
+        if uv is None or self.current is None:
+            return
+        u, v = uv
+        r, g, b = self._rgb_at(u, v)
+        self.annotations.setdefault(self.current, []).append(
+            {"x": u, "y": v, "r": r, "g": g, "b": b, "label": self.pixel_class.get()})
+        self._mark_dirty()
+        self._update_counts()
+        self._draw_annotations()
+
+    def _on_right_click(self, event):
+        """Remove the nearest label point within a small screen radius."""
+        if not self.current:
+            return
+        pts = self.annotations.get(self.current, [])
+        if not pts:
+            return
+        best_i, best_d = None, (MARKER_R + 6) ** 2
+        for i, p in enumerate(pts):
+            px = self._tlx + (p["x"] + 0.5) * self._scale
+            py = self._tly + (p["y"] + 0.5) * self._scale
+            d = (px - event.x) ** 2 + (py - event.y) ** 2
+            if d < best_d:
+                best_i, best_d = i, d
+        if best_i is not None:
+            pts.pop(best_i)
+            self._mark_dirty()
+            self._update_counts()
+            self._render_image()
+
+    def _draw_annotations(self):
+        if self.current is None:
+            return
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        for p in self.annotations.get(self.current, []):
+            px = self._tlx + (p["x"] + 0.5) * self._scale
+            py = self._tly + (p["y"] + 0.5) * self._scale
+            if -MARKER_R <= px <= cw + MARKER_R and -MARKER_R <= py <= ch + MARKER_R:
+                color = CLASS_COLORS.get(p["label"], "#ffffff")
+                self.canvas.create_oval(px - MARKER_R, py - MARKER_R,
+                                        px + MARKER_R, py + MARKER_R,
+                                        outline="#ffffff", width=1, fill=color,
+                                        tags="anno")
+
+    def _undo_point(self):
+        pts = self.annotations.get(self.current or "", [])
+        if pts:
+            pts.pop()
+            self._mark_dirty()
+            self._update_counts()
+            self._render_image()
+
+    def _clear_points(self):
+        if self.current and self.annotations.get(self.current):
+            if messagebox.askyesno("Clear points",
+                                   f"Remove all pixel labels on {self.current}?"):
+                self.annotations[self.current] = []
+                self._mark_dirty()
+                self._update_counts()
+                self._render_image()
+
+    def _update_counts(self):
+        pts = self.annotations.get(self.current or "", [])
+        liana = sum(1 for p in pts if p["label"] == "liana")
+        noli = sum(1 for p in pts if p["label"] == "no_liana")
+        grand = sum(len(v) for v in self.annotations.values())
+        self.count_label.config(
+            text=f"this photo — 🔴 {liana}  🔵 {noli}    |    total points: {grand}")
+
+    def _update_cursor(self):
+        self.canvas.config(cursor="crosshair" if self.annotate_mode.get() else "fleur")
+
+    # ============================================================ slider ===
     def _on_slide(self, _value):
-        v = round(self.value_var.get())
-        self.value_readout.config(text=f"COI: {v} %")
+        self.value_readout.config(text=f"COI: {round(self.value_var.get())} %")
 
     def _nudge(self, delta):
         v = min(100, max(0, round(self.value_var.get()) + delta))
         self.value_var.set(v)
         self._on_slide(v)
 
-    # -------------------------------------------------------------- submit ---
+    # ============================================================ submit ===
     def _submit(self):
         if self.current is None:
             return
-        value = round(self.value_var.get())
-        self._append_csv(self.current, value)
-        self.remaining.pop()    # remove the photo we just scored
+        self.results[self.current] = {
+            "coi": round(self.value_var.get()),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._mark_dirty()
+        self.remaining.pop()
+        # Quietly persist to the project file if we already have one.
+        if self.project_path:
+            self._write_project(self.project_path)
         self._next_image()
 
-    def _append_csv(self, filename, value):
-        new_file = not os.path.exists(self.csv_path)
-        try:
-            with open(self.csv_path, "a", newline="", encoding="utf-8") as fh:
-                writer = csv.writer(fh)
-                if new_file:
-                    writer.writerow(CSV_HEADER)
-                writer.writerow([filename, value,
-                                 datetime.now().isoformat(timespec="seconds")])
-        except Exception as exc:
-            messagebox.showerror("Could not save", f"Failed to write to CSV:\n{exc}")
+    # ====================================================== housekeeping ===
+    def _mark_dirty(self):
+        if not self.dirty:
+            self.dirty = True
+            self._update_title()
+
+    def _update_title(self):
+        name = os.path.basename(self.project_path) if self.project_path else "(unsaved)"
+        star = "•" if self.dirty else ""
+        self.title(f"COI Classifier — {name} {star}".strip())
+
+    def _confirm_discard(self):
+        """Return True if it's OK to drop current progress (saved or declined)."""
+        if not self.dirty:
+            return True
+        ans = messagebox.askyesnocancel(
+            "Unsaved changes",
+            "You have unsaved progress. Save it first?")
+        if ans is None:        # Cancel
+            return False
+        if ans:                # Yes -> save
+            return self.save_quick()
+        return True            # No -> discard
+
+    def _on_close(self):
+        if self._confirm_discard():
+            self.destroy()
 
 
 if __name__ == "__main__":

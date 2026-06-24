@@ -1,17 +1,19 @@
 # COI Classifier
 
-A tiny desktop tool for rapidly scoring close-up photos with a single
-continuous **COI** value (0–100 %). Same idea as a "Label box", but instead of
-drawing a box you drag a slider.
+A desktop tool for rapidly scoring close-up photos with a single continuous
+**COI** value (0–100 %), plus collecting pixel-level **liana / not-liana**
+training samples. Same idea as a "Label box", but instead of drawing a box you
+drag a slider — and you can also click individual pixels to label them.
 
 ## How it works
 
 1. **Launch** — double-click `run.bat`, or run `python coi_classifier.py`.
-2. **Pick a folder** of close-up photos when prompted.
+2. **Open a folder** of close-up photos (File ▸ Open Folder, or the prompt on
+   launch).
 3. A **random un-scored photo** appears.
-4. **Zoom in** to inspect detail (see below), then **drag the slider** at the
-   bottom (0–100 %) to set the COI.
-5. Click **Submit** (or press **Enter**) — the score is saved and the next
+4. **Zoom in** to inspect detail, optionally **label pixels** (see below), then
+   **drag the slider** (0–100 %) to set the COI.
+5. Click **Submit** (or press **Enter**) — the score is recorded and the next
    random photo loads.
 
 ### Zoom & pan
@@ -19,32 +21,59 @@ drawing a box you drag a slider.
 - **Click + drag** — pan around when zoomed in
 - **+ / − / Reset** — zoom buttons in the top bar (Reset = fit to window)
 - **Double-click** — reset to fit
-- The view resets to "fit" automatically for each new photo.
+
+### Pixel labelling (liana / not-liana)
+- Tick **“Label pixels”** in the toolbar.
+- Choose **🔴 Liana** or **🔵 Not-liana** (or press **1** / **2**).
+- **Left-click** a pixel to drop a labelled point — its `(x, y)` and RGB colour
+  are sampled from the original image.
+- **Right-click** a point to remove it; **Undo point** / **Clear this photo**
+  buttons are in the toolbar.
+- Markers stay pinned to the photo as you zoom and pan.
 
 ### Shortcuts
 - **Enter** — submit current photo
-- **← / →** — nudge the slider by 1
-- **Shift + ← / →** — nudge by 5
+- **← / →** — nudge the slider by 1 · **Shift + ← / →** — by 5
+- **1 / 2** — select Liana / Not-liana
+- **Ctrl+S** — Save project · **Ctrl+Shift+S** — Save As
 
-## Output
+## Saving progress (projects)
 
-A CSV called `coi_labels.csv` is written **inside the photo folder** you chose:
+Use the **Save** / **Save As** buttons (or the File menu) to store **all
+progress — COI scores *and* pixel labels — in a `.coiproj` project file**. You
+can close the app and reopen the project later (File ▸ Open Project) to carry on
+exactly where you left off. Once a project is saved, each **Submit** auto-saves
+to it. The app also warns about unsaved changes before closing.
 
-| filename        | coi | timestamp           |
-|-----------------|-----|---------------------|
-| IMG_0123.jpg    | 42  | 2026-06-24T14:05:31 |
+## Exporting data
 
-Each Submit appends one row. Open it in Excel/R for analysis.
+From the **File** menu:
 
-## Resume support
+- **Export COI CSV** — one row per scored photo:
 
-The app reads the existing `coi_labels.csv` on launch and **skips photos that
-are already scored**, so you can stop and come back later, or have several
-people work through the same folder in turns.
+  | filename     | coi | timestamp           |
+  |--------------|-----|---------------------|
+  | IMG_0123.jpg | 42  | 2026-06-24T14:05:31 |
+
+- **Export Pixel Labels CSV** — one row per labelled pixel:
+
+  | filename     | x   | y   | r   | g   | b   | label    |
+  |--------------|-----|-----|-----|-----|-----|----------|
+  | IMG_0123.jpg | 512 | 340 | 38  | 71  | 22  | liana    |
+
+The **photo filename is the first column** in both exports.
 
 ## Requirements
 
 - Python 3.8+
-- Pillow — install with `pip install pillow` (already present in your env)
+- Pillow — `pip install pillow`
 
 Supported image types: jpg, jpeg, png, bmp, gif, tif, tiff, webp.
+
+## Command line
+
+```
+python coi_classifier.py                 # prompts for a folder
+python coi_classifier.py path/to/photos  # open a folder directly
+python coi_classifier.py session.coiproj # reopen a saved project
+```
