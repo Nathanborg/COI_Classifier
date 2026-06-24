@@ -16,6 +16,14 @@ drag a slider — and you can also click individual pixels to label them.
 5. Click **Submit** (or press **Enter**) — the score is recorded and the next
    random photo loads.
 
+### Moving across images
+- **Top slider** — drag to scrub to any photo in the set.
+- **◀ Prev / Next ▶** buttons, or **PageUp / PageDown**.
+- The bar shows `position / total` and whether the current photo is
+  `✓ scored` or `○ unscored`. Revisiting a scored photo restores its COI value
+  and pixel labels. (Submit is still what records a score — just navigating
+  past a photo doesn't score it.)
+
 ### Zoom & pan
 - **Mouse wheel** — zoom in / out, centred on the cursor
 - **Click + drag** — pan around when zoomed in

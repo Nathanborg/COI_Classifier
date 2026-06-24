@@ -68,8 +68,10 @@ class COIClassifier(tk.Tk):
         self.folder = None
         self.project_path = None             # current .coiproj file (if saved)
         self.all_images = []                 # every image file in the folder
-        self.remaining = []                  # not-yet-scored queue (shuffled)
+        self.order = []                      # navigation order (shuffled once)
+        self.idx = -1                        # position within self.order
         self.current = None                  # current image filename
+        self._nav_guard = False              # suppress nav-slider feedback loop
         self.results = {}                    # filename -> {"coi", "timestamp"}
         self.annotations = {}                # filename -> [ {x,y,r,g,b,label} ]
         self.dirty = False                   # unsaved changes?
@@ -97,6 +99,8 @@ class COIClassifier(tk.Tk):
         self.bind("<Shift-Right>", lambda e: self._nudge(5))
         self.bind("<Key-1>", lambda e: self.pixel_class.set("liana"))
         self.bind("<Key-2>", lambda e: self.pixel_class.set("no_liana"))
+        self.bind("<Prior>", lambda e: self._prev())   # PageUp  -> previous image
+        self.bind("<Next>", lambda e: self._next())    # PageDown -> next image
 
         # A folder OR a project file may be passed on the command line.
         arg = sys.argv[1] if len(sys.argv) > 1 else None
@@ -171,6 +175,22 @@ class COIClassifier(tk.Tk):
             top, text="", bg="#2a2a2a", fg="#9ad29a", font=("Segoe UI", 10, "bold"))
         self.progress_label.pack(side="right", padx=12)
 
+        # ---- Navigation bar: move across images -------------------------
+        nav = tk.Frame(self, bg="#262626")
+        nav.pack(side="top", fill="x")
+        ttk.Button(nav, text="◀ Prev", command=self._prev).pack(
+            side="left", padx=(12, 4), pady=6)
+        self.nav_var = tk.DoubleVar(value=1)
+        self.nav_slider = ttk.Scale(nav, from_=1, to=1, orient="horizontal",
+                                    variable=self.nav_var,
+                                    command=self._on_nav_slide)
+        self.nav_slider.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(nav, text="Next ▶", command=self._next).pack(
+            side="left", padx=4, pady=6)
+        self.nav_label = tk.Label(nav, text="—", bg="#262626", fg="#cccccc",
+                                  font=("Segoe UI", 9), width=22, anchor="w")
+        self.nav_label.pack(side="left", padx=(8, 12))
+
         # ---- Pixel-labelling toolbar ------------------------------------
         annot = tk.Frame(self, bg="#232323")
         annot.pack(side="top", fill="x")
@@ -242,7 +262,7 @@ class COIClassifier(tk.Tk):
 
         hint = tk.Label(
             bottom,
-            text="Slider sets COI, then Submit.  Wheel=zoom · drag=pan · double-click=reset.  ←/→ nudge 1, Shift+←/→ nudge 5.",
+            text="Slider sets COI, then Submit.  PageUp/PageDown or the top slider move across photos.  Wheel=zoom · drag=pan.  ←/→ nudge COI.",
             bg="#2a2a2a", fg="#777777", font=("Segoe UI", 8))
         hint.grid(row=1, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 8))
         bottom.grid_columnconfigure(2, weight=1)
@@ -281,12 +301,16 @@ class COIClassifier(tk.Tk):
         self.project_path = project_path
         self.dirty = False
 
-        self.remaining = [f for f in images if f not in self.results]
-        random.shuffle(self.remaining)
+        self.order = list(images)
+        random.shuffle(self.order)
+        self.nav_slider.config(to=max(1, len(self.order)))
+        # Start at the first not-yet-scored photo (handy when resuming).
+        start = next((i for i, f in enumerate(self.order)
+                      if f not in self.results), 0)
 
         self.folder_label.config(text=f"📁 {folder}")
         self._update_title()
-        self._next_image()
+        self._go_to(start)
 
     # ===================================================== project files ===
     def _project_state(self):
@@ -412,26 +436,13 @@ class COIClassifier(tk.Tk):
         messagebox.showinfo("Exported",
                             f"{total} pixel label(s) written to:\n{path}")
 
-    # ============================================================ images ===
-    def _next_image(self):
-        total = len(self.all_images)
-        done = len(self.results)
-        self.progress_label.config(text=f"{done} / {total} scored")
-
-        if not self.remaining:
-            self.current = None
-            self._raw_image = None
-            self._show_message("🎉  All photos scored!")
-            self.name_label.config(text="Use File ▸ Export to save your results.")
-            self.slider.state(["disabled"])
-            self.submit_btn.state(["disabled"])
-            self._update_counts()
+    # ======================================================== navigation ===
+    def _go_to(self, idx):
+        """Show the image at position `idx` in the navigation order."""
+        if not self.order:
             return
-
-        self.slider.state(["!disabled"])
-        self.submit_btn.state(["!disabled"])
-        self.current = self.remaining[-1]   # peek; popped on submit
-        self.name_label.config(text=self.current)
+        self.idx = max(0, min(len(self.order) - 1, idx))
+        self.current = self.order[self.idx]
 
         path = os.path.join(self.folder, self.current)
         try:
@@ -440,17 +451,47 @@ class COIClassifier(tk.Tk):
             if self._raw_image.mode not in ("RGB", "RGBA", "L"):
                 self._raw_image = self._raw_image.convert("RGB")
         except Exception as exc:
+            self._raw_image = None
+            self._show_message("⚠ could not open image")
             messagebox.showerror("Cannot open image", f"{self.current}\n\n{exc}")
-            self.remaining.pop()
-            self._next_image()
+            self._update_nav()
             return
 
-        # Restore a previous score if this photo was already labelled.
+        self.slider.state(["!disabled"])
+        self.submit_btn.state(["!disabled"])
+        # Restore a previous score if this photo was already scored.
         prev = self.results.get(self.current)
         self.value_var.set(prev["coi"] if prev else 50.0)
         self._on_slide(self.value_var.get())
+        self._update_nav()
         self._update_counts()
         self._reset_view()
+
+    def _next(self):
+        if self.order and self.idx < len(self.order) - 1:
+            self._go_to(self.idx + 1)
+
+    def _prev(self):
+        if self.order and self.idx > 0:
+            self._go_to(self.idx - 1)
+
+    def _on_nav_slide(self, _value):
+        if self._nav_guard or not self.order:
+            return
+        target = int(round(self.nav_var.get())) - 1
+        if target != self.idx:
+            self._go_to(target)
+
+    def _update_nav(self):
+        total = len(self.order)
+        self.progress_label.config(text=f"{len(self.results)} / {total} scored")
+        # Move the slider thumb without retriggering its callback.
+        self._nav_guard = True
+        self.nav_var.set(self.idx + 1)
+        self._nav_guard = False
+        scored = "✓ scored" if self.current in self.results else "○ unscored"
+        self.nav_label.config(text=f"{self.idx + 1} / {total}   {scored}")
+        self.name_label.config(text=self.current or "")
 
     # ====================================================== view / zoom ===
     def _fit_scale(self):
@@ -674,11 +715,16 @@ class COIClassifier(tk.Tk):
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         self._mark_dirty()
-        self.remaining.pop()
         # Quietly persist to the project file if we already have one.
         if self.project_path:
             self._write_project(self.project_path)
-        self._next_image()
+        # Advance to the next photo, or stay on the last one.
+        if self.idx < len(self.order) - 1:
+            self._go_to(self.idx + 1)
+        else:
+            self._update_nav()
+            if len(self.results) == len(self.order):
+                messagebox.showinfo("Done", f"All {len(self.order)} photos scored.")
 
     # ====================================================== housekeeping ===
     def _mark_dirty(self):
